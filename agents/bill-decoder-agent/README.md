@@ -2,6 +2,8 @@
 
 > Upload a photo or PDF of any Indian utility bill and get a plain-language explanation of every charge, plus warnings about anything unusual.
 
+**Live demo:** https://bill-decoder-00-14.streamlit.app
+
 ---
 
 ## Overview
