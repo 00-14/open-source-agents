@@ -211,6 +211,29 @@ Here is a simple breakdown of your electricity bill:
 
 ---
 
+## Guardrails
+
+This project uses **custom guardrails** written in Python (no third-party guardrail framework). Shared checks live in [`guardrails.py`](guardrails.py).
+
+| Guardrail | Type | How it works |
+| :--- | :--- | :--- |
+| File type check | Input validation | Only JPG, PNG, WEBP and PDF are accepted (CLI and web). |
+| File size limit | Input validation | Files over 10 MB are rejected (`MAX_FILE_MB`, plus `server.maxUploadSize` in `.streamlit/config.toml`). |
+| Prompt-injection rule | Input safety | Every prompt tells Gemini to treat text inside the bill as data and to ignore any instructions written in it. |
+| Grounding rule | Anti-hallucination | Gemini must use only what is printed on the bill and write "Not shown" instead of guessing. |
+| Not-a-bill check | Relevance check | The web app's schema has an `is_bill` field. Non-bill uploads get a friendly message instead of an invented explanation. |
+| Structured output | Schema enforcement | The web app forces a JSON response (Pydantic `BillReport` schema), so the answer can't drift off-topic. |
+| Math check | Output validation | The app checks that the charges add up to the total (±₹2 or 2% for rounding) and warns the user if they don't. |
+| Output sanitization | Output safety | All model text is HTML-escaped before it is shown on the page. |
+| Usage limits | Abuse / cost protection | Web app: max 5 bills per visit, 20-second cooldown between requests, and 200 bills per day across all visitors. |
+| Least privilege | Safety | The model has no tools. It can't run code, call other services or change files. |
+| Secrets management | Security | The API key is read from `.env` or Streamlit Secrets and is never committed. |
+| Disclaimer | User safety | The page and README state that this is informational, not financial advice. |
+
+**Limitations of the guardrails:** the per-visit limit is stored in the browser session and resets if the page is reloaded; the daily limit resets when the app restarts. The math check only runs when every amount can be read.
+
+---
+
 ## Future Improvements
 
 - [ ] Compare two bills (this month vs last month) side by side.

@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import errors, types
 
-SUPPORTED_TYPES = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
+from guardrails import INJECTION_RULE, check_file
 
 PROMPT = """You are a friendly assistant that explains Indian utility bills
 (electricity, water, gas, mobile, broadband) to ordinary people.
@@ -48,16 +48,15 @@ Rules:
 - Only use information that is actually printed on the bill.
 - If something is unclear or unreadable, say so instead of guessing.
 - If the file is not a bill, say so and stop.
-"""
+""" + INJECTION_RULE
 
 
 def decode_bill(file_path: str, language: str) -> str:
     """Send the bill to Gemini and return the explanation text."""
     mime_type, _ = mimetypes.guess_type(file_path)
-    if mime_type not in SUPPORTED_TYPES:
-        raise ValueError(
-            f"Unsupported file type: {mime_type}. Use a JPG, PNG, WEBP or PDF file."
-        )
+    problem = check_file(mime_type, os.path.getsize(file_path))
+    if problem:
+        raise ValueError(problem)
 
     with open(file_path, "rb") as f:
         file_bytes = f.read()

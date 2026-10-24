@@ -5,8 +5,11 @@ Run locally:
     streamlit run app.py
 """
 
+import datetime
 import html
 import os
+import threading
+import time
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -14,9 +17,14 @@ from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel
 
-from main import SUPPORTED_TYPES
+from guardrails import INJECTION_RULE, charges_add_up, check_file
 
 load_dotenv()
+
+# Usage limits that protect the shared Gemini API quota on a public deployment.
+MAX_BILLS_PER_VISITOR = 5
+COOLDOWN_SECONDS = 20
+MAX_BILLS_PER_DAY = 200  # across all visitors
 
 # On Streamlit Community Cloud the key comes from the app's Secrets settings.
 if not os.getenv("GEMINI_API_KEY"):
@@ -63,14 +71,47 @@ e.g. "₹ 145.00".
 
 - is_bill: false if the file is not a utility bill (then leave other fields empty).
 - summary: 1-2 sentences saying what the person needs to know or do.
-- charges: every line item with its amount and a one-line plain explanation.
+- charges: every individual line item with its amount and a one-line plain
+  explanation. Include credits, subsidies and arrears as negative amounts. Do not
+  include subtotal or total lines, so the charges add up to total_amount.
 - red_flags: late fees, interest, arrears, estimated meter readings, usage spikes,
   unknown charges, calculation mistakes or pending deposits. Empty list if none.
 - tips: 2 or 3 practical money-saving tips for this bill type.
 
 Only use information printed on the bill. Write "Not shown" when a value is missing
 or unreadable instead of guessing.
-"""
+""" + INJECTION_RULE
+
+
+@st.cache_resource
+def daily_usage() -> dict:
+    """App-wide counter shared by all visitors: {"date": ..., "count": ..., "lock": ...}."""
+    return {"date": datetime.date.today(), "count": 0, "lock": threading.Lock()}
+
+
+def usage_problem() -> str | None:
+    """Return a message if this request should be blocked by a usage limit."""
+    state = st.session_state
+    if state.get("bills_used", 0) >= MAX_BILLS_PER_VISITOR:
+        return f"You have reached the limit of {MAX_BILLS_PER_VISITOR} bills for this visit. Please come back later."
+    wait = COOLDOWN_SECONDS - (time.time() - state.get("last_request", 0))
+    if wait > 0:
+        return f"Please wait {int(wait) + 1} seconds before decoding another bill."
+    usage = daily_usage()
+    with usage["lock"]:
+        if usage["date"] != datetime.date.today():
+            usage["date"], usage["count"] = datetime.date.today(), 0
+        if usage["count"] >= MAX_BILLS_PER_DAY:
+            return "This free demo has reached its daily limit. Please try again tomorrow."
+    return None
+
+
+def record_usage() -> None:
+    st.session_state["bills_used"] = st.session_state.get("bills_used", 0) + 1
+    st.session_state["last_request"] = time.time()
+    usage = daily_usage()
+    with usage["lock"]:
+        usage["count"] += 1
 
 
 def decode_bill_report(file_bytes: bytes, mime_type: str, language: str) -> BillReport:
@@ -292,10 +333,16 @@ if decode and uploaded:
     if not os.getenv("GEMINI_API_KEY"):
         st.error("GEMINI_API_KEY is not set. Add it to .env (local) or the app's Secrets (cloud).")
         st.stop()
-    if uploaded.type not in SUPPORTED_TYPES:
-        st.error(f"Unsupported file type: {uploaded.type}")
+    problem = check_file(uploaded.type, uploaded.size)
+    if problem:
+        st.error(f"📄 {problem}")
+        st.stop()
+    problem = usage_problem()
+    if problem:
+        st.warning(f"⏳ {problem}")
         st.stop()
 
+    record_usage()
     with st.spinner("🔍 Reading your bill… please wait"):
         try:
             report = decode_bill_report(uploaded.getvalue(), uploaded.type, language)
@@ -324,6 +371,13 @@ if decode and uploaded:
     c3, c4 = st.columns(2)
     c3.markdown(card("🏢 BILL FROM", f"{report.provider} · {report.bill_type}"), unsafe_allow_html=True)
     c4.markdown(card("🗓️ BILLING PERIOD", report.billing_period), unsafe_allow_html=True)
+
+    # Math check: the AI can misread numbers, so verify the charges add up.
+    if charges_add_up([c.amount for c in report.charges], report.total_amount) is False:
+        st.warning(
+            "🧮 The charges we read don't add up to the total. The photo may be unclear, "
+            "so please double-check the amounts on your paper bill."
+        )
 
     # 2. Warnings next, so nobody misses them
     st.markdown(
