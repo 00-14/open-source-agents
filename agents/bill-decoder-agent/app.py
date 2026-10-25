@@ -15,10 +15,11 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel
 
+from bill_terms import TERM_NOTES
+from main import generate_with_fallback
 from guardrails import (
     INJECTION_RULE,
     charges_add_up,
@@ -34,7 +35,7 @@ load_dotenv()
 # Usage limits that protect the shared Gemini API quota on a public deployment.
 MAX_BILLS_PER_VISITOR = 5
 COOLDOWN_SECONDS = 20
-MAX_BILLS_PER_DAY = 200  # across all visitors
+MAX_BILLS_PER_DAY = 60  # across all visitors (free tier: ~20 per model per day)
 
 # On Streamlit Community Cloud the key comes from the app's Secrets settings.
 if not os.getenv("GEMINI_API_KEY"):
@@ -52,6 +53,7 @@ class Charge(BaseModel):
     name: str
     amount: str
     explanation: str
+    info: str
 
 
 class RedFlag(BaseModel):
@@ -72,6 +74,17 @@ class Usage(BaseModel):
     reading_type: str
     daily_average: str
     compared_to_last_period: str
+
+
+class SectionHelp(BaseModel):
+    at_a_glance: str
+    actions: str
+    red_flags: str
+    usage: str
+    charges: str
+    subsidies: str
+    payment: str
+    tips: str
 
 
 class MonthUsage(BaseModel):
@@ -100,6 +113,7 @@ class BillReport(BaseModel):
     payment_options: list[str]
     glossary: list[Term]
     tips: list[str]
+    section_help: SectionHelp
 
 
 WEB_PROMPT = """You are a friendly assistant that explains Indian utility bills
@@ -123,10 +137,15 @@ bill, e.g. "₹ 145.00".
 - usage_history: past periods' usage if the bill prints a history table or graph,
   oldest first, using numbers only. Empty list if not printed.
 - charges: every individual line item with its amount and a one-line plain
-  explanation. Include credits, subsidies and arrears as negative amounts. Do not
-  include subtotal or total lines, so the charges add up to total_amount.
+  explanation of what it is on this bill. Include credits, subsidies and arrears as
+  negative amounts. Do not include subtotal or total lines, so the charges add up to
+  total_amount.
+- charges[].info: 3-4 short sentences for a person who has never seen this term:
+  (1) what it means in everyday words, (2) why the company charges it, and
+  (3) whether the person can reduce or avoid it, and how. No jargon.
 - subsidies: government schemes, discounts or rebates applied (e.g. Gruha Jyothi),
-  with amount and a short explanation. Empty list if none.
+  with amount, a short explanation, and info (same rules as charges[].info, but
+  explain who gives it and how to keep getting it). Empty list if none.
 - red_flags: late fees, interest, arrears, estimated meter readings, usage spikes,
   unknown charges, calculation mistakes or pending deposits. Empty list if none.
 - last_payment: the previous payment amount and date, if printed.
@@ -134,10 +153,16 @@ bill, e.g. "₹ 145.00".
 - glossary: 3-6 technical words or abbreviations printed on this bill (e.g. FPPCA,
   kWh, Arrears, ASD) with a one-line simple meaning.
 - tips: 2 or 3 practical money-saving tips for this bill type.
+- section_help: for each section, 1-2 simple sentences telling a first-time reader
+  what that section of the report shows and why it matters, written for this bill
+  type (e.g. for a mobile bill, usage means data in GB and minutes).
+
+The meaning of terms (info, glossary, section_help) may come from the reference
+notes below or general knowledge. Everything else must come from the bill.
 
 Only use information printed on the bill. Write "Not shown" when a value is missing
 or unreadable instead of guessing.
-""" + INJECTION_RULE
+""" + TERM_NOTES + INJECTION_RULE
 
 
 @st.cache_resource
@@ -172,17 +197,12 @@ def record_usage() -> None:
 
 
 def decode_bill_report(file_bytes: bytes, mime_type: str, language: str) -> BillReport:
-    client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-    response = client.models.generate_content(
-        model=os.getenv("MODEL_NAME", "gemini-3.5-flash"),
-        contents=[
+    response = generate_with_fallback(
+        [
             types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
             WEB_PROMPT.format(language=language) + date_rule(datetime.date.today()),
         ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=BillReport,
-        ),
+        types.GenerateContentConfig(response_mime_type="application/json", response_schema=BillReport),
     )
     return response.parsed
 
@@ -348,6 +368,28 @@ st.markdown(
     .subsidy { border-left: 6px solid var(--green); }
     .subsidy .amt { color: var(--green); }
 
+    /* "What does this mean?" info buttons (native <details>, works with keyboard) */
+    details.info { margin-top: 10px; }
+    details.info summary {
+        display: inline-flex; align-items: center; gap: 6px; min-height: 40px;
+        list-style: none; cursor: pointer; user-select: none;
+        color: #bfdbfe; font-weight: 700; font-size: .95rem;
+        padding: 6px 14px; border: 1.5px solid rgba(59,130,246,.6); border-radius: 999px;
+        transition: background .15s, border-color .15s;
+    }
+    details.info summary::-webkit-details-marker { display: none; }
+    details.info summary:hover { background: rgba(59,130,246,.18); border-color: var(--blue); }
+    details.info summary:focus-visible { outline: 3px solid var(--amber); outline-offset: 3px; }
+    details.info[open] summary { background: rgba(59,130,246,.22); border-color: var(--blue); }
+    details.info .body {
+        margin-top: 10px; padding: 14px 16px; border-radius: 12px;
+        background: var(--surface-2); border: 1px solid var(--border);
+        color: var(--text); font-size: 1.02rem; line-height: 1.65;
+    }
+    .section-wrap { margin: 30px 0 12px; }
+    .section-wrap .section { margin: 0; }
+    .section-wrap details.info { margin-top: 6px; }
+
     /* Glossary */
     .term { font-weight: 800; color: #93c5fd; font-size: 1.05rem; }
 
@@ -366,6 +408,31 @@ st.markdown(
 def shown(value: str) -> bool:
     """False when the AI left a field empty or wrote "Not shown"."""
     return bool(value and value.strip()) and "not shown" not in value.lower()
+
+
+def info_box(text: str, label: str = "ℹ️ What does this mean?") -> str:
+    """A tap-to-open explanation. Returns '' when there is nothing to explain."""
+    if not shown(text):
+        return ""
+    return f'<details class="info"><summary>{label}</summary><div class="body">{html.escape(text)}</div></details>'
+
+
+def section(title: str, help_text: str = "") -> None:
+    """Section heading with an optional 'What is this section?' button below it."""
+    st.markdown(
+        f'<div class="section-wrap"><div class="section">{title}</div>'
+        f'{info_box(help_text, "ℹ️ What is this section?")}</div>',
+        unsafe_allow_html=True,
+    )
+
+
+def charge_card(c: Charge, extra_class: str = "") -> None:
+    st.markdown(
+        f'<div class="card {extra_class}"><div class="charge"><span class="name">{html.escape(c.name)}</span>'
+        f'<span class="amt">{html.escape(c.amount)}</span></div>'
+        f'<div class="why">{html.escape(c.explanation)}</div>{info_box(c.info)}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def card(label: str, value: str, extra_class: str = "") -> str:
@@ -447,6 +514,8 @@ if decode and uploaded:
         except errors.APIError as e:
             if e.code == 503:
                 st.warning("⏳ The AI is busy right now. Please wait one minute and press the button again.")
+            elif e.code == 429:
+                st.warning("📅 This free demo has used up today's AI limit. Please try again later or tomorrow.")
             else:
                 st.error(f"Something went wrong with the AI service ({e.code}): {e.message}")
             st.stop()
@@ -462,7 +531,8 @@ if decode and uploaded:
     odd = suspicious_dates([report.bill_date, report.due_date, report.billing_period], today)
 
     # 1. The most important facts first
-    st.markdown('<div class="section">📋 Your bill at a glance</div>', unsafe_allow_html=True)
+    help_ = report.section_help
+    section("📋 Your bill at a glance", help_.at_a_glance)
     if report.summary:
         st.markdown(f'<div class="summary">{html.escape(report.summary)}</div>', unsafe_allow_html=True)
 
@@ -512,7 +582,12 @@ if decode and uploaded:
         )
 
     # Math check: the AI can misread numbers, so verify the charges add up.
-    if charges_add_up([c.amount for c in report.charges], report.total_amount) is False:
+    # Subsidies listed only in the subsidies section are deductions too.
+    charge_names = {c.name.strip().lower() for c in report.charges}
+    amounts = [c.amount for c in report.charges] + [
+        "-" + s.amount.replace("-", "") for s in report.subsidies if s.name.strip().lower() not in charge_names
+    ]
+    if charges_add_up(amounts, report.total_amount) is False:
         st.warning(
             "🧮 The charges we read don't add up to the total. The photo may be unclear, "
             "so please double-check the amounts on your paper bill."
@@ -520,14 +595,12 @@ if decode and uploaded:
 
     # 2. What to do now
     if report.action_steps:
-        st.markdown('<div class="section">✅ What you should do now</div>', unsafe_allow_html=True)
+        section("✅ What you should do now", help_.actions)
         items = "".join(f'<div class="item">{html.escape(s)}</div>' for s in report.action_steps)
         st.markdown(f'<div class="todo">{items}</div>', unsafe_allow_html=True)
 
     # 3. Warnings, so nobody misses them
-    st.markdown(
-        f'<div class="section">🚩 Things to check ({len(report.red_flags)})</div>', unsafe_allow_html=True
-    )
+    section(f"🚩 Things to check ({len(report.red_flags)})", help_.red_flags)
     if report.red_flags:
         for f in report.red_flags:
             st.markdown(
@@ -541,7 +614,7 @@ if decode and uploaded:
     # 4. Usage and meter readings
     u = report.usage
     if shown(u.units_used):
-        st.markdown('<div class="section">⚡ How much you used</div>', unsafe_allow_html=True)
+        section("⚡ How much you used", help_.usage)
         unit = html.escape(u.unit_name) if shown(u.unit_name) else ""
         s1, s2 = st.columns(2)
         s1.markdown(
@@ -569,7 +642,7 @@ if decode and uploaded:
     # Usage history chart, only when the bill prints past months
     if len(report.usage_history) >= 2:
         unit_label = u.unit_name if shown(u.unit_name) else "Units"
-        st.markdown(f'<div class="section">📈 Your usage in past months ({html.escape(unit_label)})</div>', unsafe_allow_html=True)
+        section(f"📈 Your usage in past months ({html.escape(unit_label)})")
         df = pd.DataFrame([{"Period": m.period, unit_label: m.units} for m in report.usage_history])
         chart = (
             alt.Chart(df)
@@ -587,31 +660,19 @@ if decode and uploaded:
             st.dataframe(df, hide_index=True, width="stretch")
 
     # 5. Every charge explained
-    st.markdown(
-        f'<div class="section">💰 What you are paying for ({len(report.charges)})</div>', unsafe_allow_html=True
-    )
+    section(f"💰 What you are paying for ({len(report.charges)})", help_.charges)
     for c in report.charges:
-        st.markdown(
-            f'<div class="card"><div class="charge"><span class="name">{html.escape(c.name)}</span>'
-            f'<span class="amt">{html.escape(c.amount)}</span></div>'
-            f'<div class="why">{html.escape(c.explanation)}</div></div>',
-            unsafe_allow_html=True,
-        )
+        charge_card(c)
 
     # 6. Subsidies and discounts
     if report.subsidies:
-        st.markdown('<div class="section">🎁 Discounts and subsidies you got</div>', unsafe_allow_html=True)
+        section("🎁 Discounts and subsidies you got", help_.subsidies)
         for s in report.subsidies:
-            st.markdown(
-                f'<div class="card subsidy"><div class="charge"><span class="name">{html.escape(s.name)}</span>'
-                f'<span class="amt">{html.escape(s.amount)}</span></div>'
-                f'<div class="why">{html.escape(s.explanation)}</div></div>',
-                unsafe_allow_html=True,
-            )
+            charge_card(s, "subsidy")
 
     # 7. Payment details
     if shown(report.last_payment) or report.payment_options:
-        st.markdown('<div class="section">💳 Payment details</div>', unsafe_allow_html=True)
+        section("💳 Payment details", help_.payment)
         if shown(report.last_payment):
             st.markdown(card("LAST PAYMENT RECEIVED", report.last_payment), unsafe_allow_html=True)
         if report.payment_options:
@@ -619,7 +680,7 @@ if decode and uploaded:
             st.markdown(f'<div class="card"><div class="label">WAYS TO PAY</div><ul>{ways}</ul></div>', unsafe_allow_html=True)
 
     # 8. Tips
-    st.markdown('<div class="section">💡 Ways to save money</div>', unsafe_allow_html=True)
+    section("💡 Ways to save money", help_.tips)
     for t in report.tips:
         st.markdown(f'<div class="card tip">💡 {html.escape(t)}</div>', unsafe_allow_html=True)
 
@@ -652,7 +713,7 @@ if decode and uploaded:
         f"Usage: {u.units_used} {u.unit_name} (reading: {u.reading_type})",
         "",
         "Charges:",
-        *[f"- {c.name}: {c.amount} — {c.explanation}" for c in report.charges],
+        *[f"- {c.name}: {c.amount} — {c.explanation}\n    What it means: {c.info}" for c in report.charges],
         "",
         "Subsidies:",
         *([f"- {s.name}: {s.amount} — {s.explanation}" for s in report.subsidies] or ["- None"]),

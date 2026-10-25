@@ -20,6 +20,7 @@
 - **Money-saving tips**: practical tips specific to the bill type.
 - **Two ways to use it**: a command-line tool (`main.py`) and a dark-mode web app (`app.py`) with large text and simple steps, designed for users of all ages.
 - **Detailed web report**: due-date countdown, a "what to do now" checklist, usage and meter readings (actual vs estimated, daily average), a usage-history chart when the bill prints past months, subsidies applied, payment details, and a glossary of terms printed on the bill.
+- **Tap-to-learn explanations**: every charge (e.g. Fixed Charges, FPPCA, P & G Surcharge, True-up Charges) has an **ℹ️ What does this mean?** button explaining what it is, why it's charged and whether it can be reduced. Every section has an **ℹ️ What is this section?** button too.
 
 ---
 
@@ -197,6 +198,8 @@ Here is a simple breakdown of your electricity bill:
 - Accuracy depends on photo quality; blurry, dark or cropped photos may be read incorrectly.
 - Usage-spike detection only works if the bill itself prints previous months' usage.
 - It explains what is printed on the bill; it does not check official tariff rates from the provider.
+- The Gemini free tier allows about 20 requests per day per model (seen during testing); the app falls back to backup models, but heavy use can still exhaust the daily quota.
+- Explanations of terms (the ℹ️ buttons) come from reference notes and the model's general knowledge, not from the bill itself, and may not cover every regional term.
 - Free-tier Gemini API rate limits apply. During high demand Gemini may return a "model is busy" (503) error; wait a minute and retry, or set a different model with `MODEL_NAME` in `.env`.
 - New Google AI Studio keys starting with `AQ.` were rejected by the Gemini API during testing (`401 ACCESS_TOKEN_TYPE_UNSUPPORTED`). A standard `AIza...` key from the Google Cloud Console **APIs & Services → Credentials** page worked.
 - Tested on Windows; Linux/macOS should work but are untested.
@@ -225,9 +228,11 @@ This project uses **custom guardrails** written in Python (no third-party guardr
 | Not-a-bill check | Relevance check | The web app's schema has an `is_bill` field. Non-bill uploads get a friendly message instead of an invented explanation. |
 | Structured output | Schema enforcement | The web app forces a JSON response (Pydantic `BillReport` schema), so the answer can't drift off-topic. |
 | Date rule + date check | Anti-hallucination / output validation | The prompt gives Gemini today's date and tells it to copy dates exactly as printed, never "correcting" the year. Dates more than 2 years old or 1 year ahead trigger a warning, and the due-date countdown is hidden for them. |
+| Term reference notes | Grounding | [`bill_terms.py`](bill_terms.py) gives Gemini correct meanings for common Indian bill terms (e.g. P & G = Pension & Gratuity surcharge, True-up charges, Gruha Jyothi), so abbreviations aren't guessed. |
+| Model fallback | Reliability | If a model is busy (503) or out of free quota (429), the app automatically retries with backup models (`gemini-3.5-flash` → `gemini-3.5-flash-lite` → `gemini-3.1-flash-lite`). |
 | Math check | Output validation | The app checks that the charges add up to the total (±₹2 or 2% for rounding) and warns the user if they don't. |
 | Output sanitization | Output safety | All model text is HTML-escaped before it is shown on the page. |
-| Usage limits | Abuse / cost protection | Web app: max 5 bills per visit, 20-second cooldown between requests, and 200 bills per day across all visitors. |
+| Usage limits | Abuse / cost protection | Web app: max 5 bills per visit, 20-second cooldown between requests, and 60 bills per day across all visitors. |
 | Least privilege | Safety | The model has no tools. It can't run code, call other services or change files. |
 | Secrets management | Security | The API key is read from `.env` or Streamlit Secrets and is never committed. |
 | Disclaimer | User safety | The page and README state that this is informational, not financial advice. |
