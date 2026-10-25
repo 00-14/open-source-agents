@@ -7,7 +7,9 @@ Run locally:
 
 import datetime
 import html
+import logging
 import os
+import re
 import threading
 import time
 
@@ -15,7 +17,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-from google.genai import errors, types
+from google.genai import types
 from pydantic import BaseModel
 
 from bill_terms import TERM_NOTES
@@ -360,6 +362,16 @@ st.markdown(
         display: flex; align-items: center; justify-content: center;
     }
 
+    /* Friendly message card */
+    .notice {
+        display: flex; gap: 14px; align-items: center; margin: 18px 0;
+        background: var(--surface); border: 1px solid var(--border);
+        border-left: 6px solid var(--amber); border-radius: 14px; padding: 14px 16px;
+        font-size: 1.05rem;
+    }
+    .notice .icon { font-size: 1.6rem; }
+    .notice .sub { display: block; color: var(--muted); font-size: .95rem; margin-top: 2px; }
+
     /* Usage numbers */
     .stat .value { font-size: 1.6rem; }
     .stat .unit { font-size: 1rem; color: var(--muted); font-weight: 600; margin-left: 4px; }
@@ -435,6 +447,31 @@ def charge_card(c: Charge, extra_class: str = "") -> None:
     )
 
 
+def notice(icon: str, title: str, hint: str = "") -> None:
+    """A small, friendly message card used instead of raw error text."""
+    sub = f'<span class="sub">{html.escape(hint)}</span>' if hint else ""
+    st.markdown(
+        f'<div class="notice"><span class="icon">{icon}</span>'
+        f'<span><b>{html.escape(title)}</b>{sub}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def friendly_error(e: Exception) -> tuple[str, str, str]:
+    """Turn any error into (icon, title, hint) a non-technical person can understand."""
+    code = getattr(e, "code", None)
+    if code == 429:
+        match = re.search(r"retry in (?:(\d+)h)?(?:(\d+)m)?", str(e))
+        minutes = (int(match.group(1) or 0) * 60 + int(match.group(2) or 0)) if match else 0
+        hint = f"Please try again in about {minutes} minutes." if minutes else "Please try again later or tomorrow."
+        return "📅", "Today's free limit is used up", hint
+    if code == 503:
+        return "⏳", "The AI is busy right now", "Please wait a minute and press the button again."
+    if code in (400, 401, 403):
+        return "🔧", "The app is not set up correctly", "Please let the app owner know."
+    return "😕", "Something went wrong", "Please try again in a minute. If it keeps happening, try a clearer photo."
+
+
 def card(label: str, value: str, extra_class: str = "") -> str:
     return (
         f'<div class="card {extra_class}"><div class="label">{html.escape(label)}</div>'
@@ -496,35 +533,32 @@ decode = st.button(
 
 if decode and uploaded:
     if not os.getenv("GEMINI_API_KEY"):
-        st.error("GEMINI_API_KEY is not set. Add it to .env (local) or the app's Secrets (cloud).")
+        logging.error("GEMINI_API_KEY is not set. Add it to .env (local) or the app's Secrets (cloud).")
+        notice("🔧", "The app is not set up correctly", "Please let the app owner know.")
         st.stop()
     problem = check_file(uploaded.type, uploaded.size)
     if problem:
-        st.error(f"📄 {problem}")
+        notice("📄", problem, "Please upload a JPG, PNG, WEBP or PDF under 10 MB.")
         st.stop()
     problem = usage_problem()
     if problem:
-        st.warning(f"⏳ {problem}")
+        notice("⏳", problem)
         st.stop()
 
     record_usage()
     with st.spinner("🔍 Reading your bill… please wait"):
         try:
             report = decode_bill_report(uploaded.getvalue(), uploaded.type, language)
-        except errors.APIError as e:
-            if e.code == 503:
-                st.warning("⏳ The AI is busy right now. Please wait one minute and press the button again.")
-            elif e.code == 429:
-                st.warning("📅 This free demo has used up today's AI limit. Please try again later or tomorrow.")
-            else:
-                st.error(f"Something went wrong with the AI service ({e.code}): {e.message}")
+        except Exception as e:  # never show raw error text to users
+            logging.exception("Bill decoding failed")
+            notice(*friendly_error(e))
             st.stop()
 
     if report is None:
-        st.error("😕 We could not read this bill. Please try a clearer photo.")
+        notice("😕", "We could not read this bill", "Please try a clearer photo in good light.")
         st.stop()
     if not report.is_bill:
-        st.warning("🤔 This doesn't look like a bill. Please upload a photo or PDF of a bill.")
+        notice("🤔", "This doesn't look like a bill", "Please upload a photo or PDF of an electricity, water, gas, mobile or broadband bill.")
         st.stop()
 
     today = datetime.date.today()

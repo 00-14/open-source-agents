@@ -133,7 +133,7 @@ def main() -> None:
             sys.exit("Error: the Gemini model is busy right now. Wait a minute and try again.")
         if e.code == 429:
             sys.exit("Error: the free Gemini quota is used up for today on all models. Try again later.")
-        sys.exit(f"Error from Gemini API ({e.code}): {e.message}")
+        sys.exit(f"Error: something went wrong with the Gemini API (code {e.code}). Please try again later.")
 
 
 if __name__ == "__main__":
