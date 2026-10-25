@@ -11,13 +11,23 @@ import os
 import threading
 import time
 
+import altair as alt
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
 from google.genai import errors, types
 from pydantic import BaseModel
 
-from guardrails import INJECTION_RULE, charges_add_up, check_file
+from guardrails import (
+    INJECTION_RULE,
+    charges_add_up,
+    check_file,
+    date_rule,
+    parse_amount,
+    parse_date,
+    suspicious_dates,
+)
 
 load_dotenv()
 
@@ -49,33 +59,80 @@ class RedFlag(BaseModel):
     detail: str
 
 
+class Term(BaseModel):
+    term: str
+    meaning: str
+
+
+class Usage(BaseModel):
+    units_used: str
+    unit_name: str
+    previous_reading: str
+    current_reading: str
+    reading_type: str
+    daily_average: str
+    compared_to_last_period: str
+
+
+class MonthUsage(BaseModel):
+    period: str
+    units: float
+
+
 class BillReport(BaseModel):
     is_bill: bool
     bill_type: str
     provider: str
+    plan_or_tariff: str
+    bill_date: str
     billing_period: str
     total_amount: str
     due_date: str
+    amount_after_due_date: str
     summary: str
+    action_steps: list[str]
+    usage: Usage
+    usage_history: list[MonthUsage]
     charges: list[Charge]
+    subsidies: list[Charge]
     red_flags: list[RedFlag]
+    last_payment: str
+    payment_options: list[str]
+    glossary: list[Term]
     tips: list[str]
 
 
 WEB_PROMPT = """You are a friendly assistant that explains Indian utility bills
-(electricity, water, gas, mobile, broadband) to ordinary people.
+(electricity, water, gas, mobile, broadband) to ordinary people of all ages.
 
 Read the attached bill and fill in the JSON fields. Write every text value in
-{language}, using simple words. Keep amounts in the form printed on the bill,
-e.g. "₹ 145.00".
+{language}, using short, simple sentences. Keep amounts in the form printed on the
+bill, e.g. "₹ 145.00".
 
 - is_bill: false if the file is not a utility bill (then leave other fields empty).
-- summary: 1-2 sentences saying what the person needs to know or do.
+- plan_or_tariff: the tariff category or plan printed (e.g. "LT-2a Domestic", "Postpaid 399").
+- bill_date: the date the bill was issued.
+- amount_after_due_date: the amount to pay if paid late, if printed.
+- summary: 2-3 sentences saying what the person needs to know.
+- action_steps: 2-4 clear things the person should do now, most important first
+  (e.g. "Pay ₹ 820 before 15/11/2026", "Ask BESCOM why the reading is estimated").
+- usage: units used and their unit name (kWh/units, litres/KL, GB, minutes),
+  previous and current meter readings, reading_type ("Actual" or "Estimated" if
+  printed), daily_average (units per day, calculate from units and days if both are
+  printed), and compared_to_last_period (one sentence, only if previous usage is printed).
+- usage_history: past periods' usage if the bill prints a history table or graph,
+  oldest first, using numbers only. Empty list if not printed.
 - charges: every individual line item with its amount and a one-line plain
   explanation. Include credits, subsidies and arrears as negative amounts. Do not
   include subtotal or total lines, so the charges add up to total_amount.
+- subsidies: government schemes, discounts or rebates applied (e.g. Gruha Jyothi),
+  with amount and a short explanation. Empty list if none.
 - red_flags: late fees, interest, arrears, estimated meter readings, usage spikes,
   unknown charges, calculation mistakes or pending deposits. Empty list if none.
+- last_payment: the previous payment amount and date, if printed.
+- payment_options: ways to pay printed on the bill (website, app, UPI, office).
+- glossary: 3-6 technical words or abbreviations printed on this bill (e.g. FPPCA,
+  kWh, Arrears, ASD) with a one-line simple meaning.
 - tips: 2 or 3 practical money-saving tips for this bill type.
 
 Only use information printed on the bill. Write "Not shown" when a value is missing
@@ -120,7 +177,7 @@ def decode_bill_report(file_bytes: bytes, mime_type: str, language: str) -> Bill
         model=os.getenv("MODEL_NAME", "gemini-3.5-flash"),
         contents=[
             types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
-            WEB_PROMPT.format(language=language),
+            WEB_PROMPT.format(language=language) + date_rule(datetime.date.today()),
         ],
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -258,6 +315,42 @@ st.markdown(
     .tip, .ok { border-left: 6px solid var(--green); background: rgba(74,222,128,.08); font-size: 1.05rem; }
     .footer { color: var(--muted); font-size: .9rem; text-align: center; margin-top: 30px; }
 
+    /* Due-date countdown banner */
+    .due {
+        border-radius: 16px; padding: 16px 18px; margin: 4px 0 16px;
+        font-size: 1.2rem; font-weight: 800; display: flex; align-items: center; gap: 12px;
+    }
+    .due.ok   { background: rgba(74,222,128,.12); border: 2px solid var(--green); color: #bbf7d0; }
+    .due.soon { background: rgba(251,191,36,.12); border: 2px solid var(--amber); color: #fde68a; }
+    .due.late { background: rgba(248,113,113,.14); border: 2px solid var(--red); color: #fecaca; }
+    .due .icon { font-size: 1.6rem; }
+    .due .sub { display: block; font-size: .95rem; font-weight: 500; opacity: .9; }
+
+    /* "What to do now" checklist */
+    .todo { counter-reset: todo; }
+    .todo .item {
+        display: flex; gap: 14px; align-items: flex-start; font-size: 1.1rem;
+        background: var(--surface); border: 1px solid var(--border);
+        border-radius: 14px; padding: 14px 16px; margin-bottom: 10px;
+    }
+    .todo .item::before {
+        counter-increment: todo; content: counter(todo);
+        flex: none; width: 32px; height: 32px; border-radius: 50%;
+        background: var(--green); color: #052e16; font-weight: 800;
+        display: flex; align-items: center; justify-content: center;
+    }
+
+    /* Usage numbers */
+    .stat .value { font-size: 1.6rem; }
+    .stat .unit { font-size: 1rem; color: var(--muted); font-weight: 600; margin-left: 4px; }
+    .note { color: var(--muted); font-size: .95rem; margin: 2px 0 12px; }
+    .warn-card { border-left: 6px solid var(--amber); background: rgba(251,191,36,.10); }
+    .subsidy { border-left: 6px solid var(--green); }
+    .subsidy .amt { color: var(--green); }
+
+    /* Glossary */
+    .term { font-weight: 800; color: #93c5fd; font-size: 1.05rem; }
+
     /* Phones */
     @media (max-width: 640px) {
         html { font-size: 17px; }
@@ -268,6 +361,11 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+def shown(value: str) -> bool:
+    """False when the AI left a field empty or wrote "Not shown"."""
+    return bool(value and value.strip()) and "not shown" not in value.lower()
 
 
 def card(label: str, value: str, extra_class: str = "") -> str:
@@ -360,10 +458,39 @@ if decode and uploaded:
         st.warning("🤔 This doesn't look like a bill. Please upload a photo or PDF of a bill.")
         st.stop()
 
+    today = datetime.date.today()
+    odd = suspicious_dates([report.bill_date, report.due_date, report.billing_period], today)
+
     # 1. The most important facts first
     st.markdown('<div class="section">📋 Your bill at a glance</div>', unsafe_allow_html=True)
     if report.summary:
         st.markdown(f'<div class="summary">{html.escape(report.summary)}</div>', unsafe_allow_html=True)
+
+    # Due-date countdown, calculated from today's date
+    due = parse_date(report.due_date)
+    total = parse_amount(report.total_amount)
+    if total is not None and total <= 0:
+        st.markdown(
+            '<div class="due ok"><span class="icon">🎉</span><span>Nothing to pay this time'
+            '<span class="sub">Your balance is zero or in credit.</span></span></div>',
+            unsafe_allow_html=True,
+        )
+    elif due and report.due_date not in odd:
+        days = (due - today).days
+        if days < 0:
+            css, icon, text = "late", "⛔", f"Overdue by {-days} day{'s' if days != -1 else ''}"
+            sub = "Pay as soon as possible to avoid extra late fees."
+        elif days <= 5:
+            css, icon, text = "soon", "⏰", "Due today" if days == 0 else f"Due in {days} day{'s' if days != 1 else ''}"
+            sub = "Pay soon to avoid a late fee."
+        else:
+            css, icon, text = "ok", "✅", f"{days} days left to pay"
+            sub = f"Pay before {report.due_date}."
+        st.markdown(
+            f'<div class="due {css}"><span class="icon">{icon}</span><span>{text}'
+            f'<span class="sub">{html.escape(sub)}</span></span></div>',
+            unsafe_allow_html=True,
+        )
 
     c1, c2 = st.columns(2)
     c1.markdown(card("💵 AMOUNT TO PAY", report.total_amount, "big"), unsafe_allow_html=True)
@@ -371,6 +498,18 @@ if decode and uploaded:
     c3, c4 = st.columns(2)
     c3.markdown(card("🏢 BILL FROM", f"{report.provider} · {report.bill_type}"), unsafe_allow_html=True)
     c4.markdown(card("🗓️ BILLING PERIOD", report.billing_period), unsafe_allow_html=True)
+    c5, c6 = st.columns(2)
+    c5.markdown(card("🧾 BILL DATE", report.bill_date), unsafe_allow_html=True)
+    c6.markdown(card("📑 PLAN / TARIFF", report.plan_or_tariff), unsafe_allow_html=True)
+    if shown(report.amount_after_due_date):
+        st.markdown(card("⚠️ IF YOU PAY LATE", report.amount_after_due_date, "warn-card"), unsafe_allow_html=True)
+
+    # Date check: catches a misread year (e.g. a 2026 bill read as 2023)
+    if odd:
+        st.warning(
+            f"📆 Some dates look unusual ({', '.join(odd)}). If your bill is more recent, "
+            "the photo may be unclear. Please check the dates on your paper bill."
+        )
 
     # Math check: the AI can misread numbers, so verify the charges add up.
     if charges_add_up([c.amount for c in report.charges], report.total_amount) is False:
@@ -379,7 +518,13 @@ if decode and uploaded:
             "so please double-check the amounts on your paper bill."
         )
 
-    # 2. Warnings next, so nobody misses them
+    # 2. What to do now
+    if report.action_steps:
+        st.markdown('<div class="section">✅ What you should do now</div>', unsafe_allow_html=True)
+        items = "".join(f'<div class="item">{html.escape(s)}</div>' for s in report.action_steps)
+        st.markdown(f'<div class="todo">{items}</div>', unsafe_allow_html=True)
+
+    # 3. Warnings, so nobody misses them
     st.markdown(
         f'<div class="section">🚩 Things to check ({len(report.red_flags)})</div>', unsafe_allow_html=True
     )
@@ -393,7 +538,55 @@ if decode and uploaded:
     else:
         st.markdown('<div class="card ok">✅ Nothing unusual found. Your bill looks normal.</div>', unsafe_allow_html=True)
 
-    # 3. Every charge explained
+    # 4. Usage and meter readings
+    u = report.usage
+    if shown(u.units_used):
+        st.markdown('<div class="section">⚡ How much you used</div>', unsafe_allow_html=True)
+        unit = html.escape(u.unit_name) if shown(u.unit_name) else ""
+        s1, s2 = st.columns(2)
+        s1.markdown(
+            f'<div class="card stat"><div class="label">TOTAL USED</div>'
+            f'<div class="value">{html.escape(u.units_used)}<span class="unit">{unit}</span></div></div>',
+            unsafe_allow_html=True,
+        )
+        s2.markdown(
+            f'<div class="card stat"><div class="label">PER DAY (AVERAGE)</div>'
+            f'<div class="value">{html.escape(u.daily_average)}<span class="unit">{unit}</span></div></div>',
+            unsafe_allow_html=True,
+        )
+        if shown(u.previous_reading) or shown(u.current_reading):
+            r1, r2, r3 = st.columns(3)
+            r1.markdown(card("PREVIOUS READING", u.previous_reading), unsafe_allow_html=True)
+            r2.markdown(card("CURRENT READING", u.current_reading), unsafe_allow_html=True)
+            estimated = "estim" in u.reading_type.lower()
+            r3.markdown(
+                card("READING TYPE", ("⚠️ " if estimated else "✅ ") + u.reading_type, "warn-card" if estimated else ""),
+                unsafe_allow_html=True,
+            )
+        if shown(u.compared_to_last_period):
+            st.markdown(f'<div class="note">📊 {html.escape(u.compared_to_last_period)}</div>', unsafe_allow_html=True)
+
+    # Usage history chart, only when the bill prints past months
+    if len(report.usage_history) >= 2:
+        unit_label = u.unit_name if shown(u.unit_name) else "Units"
+        st.markdown(f'<div class="section">📈 Your usage in past months ({html.escape(unit_label)})</div>', unsafe_allow_html=True)
+        df = pd.DataFrame([{"Period": m.period, unit_label: m.units} for m in report.usage_history])
+        chart = (
+            alt.Chart(df)
+            .mark_bar(color="#3b82f6", cornerRadiusTopLeft=4, cornerRadiusTopRight=4, size=28)
+            .encode(
+                x=alt.X("Period:N", sort=None, title=None, axis=alt.Axis(labelAngle=0, labelColor="#b4bac8", labelFontSize=13)),
+                y=alt.Y(f"{unit_label}:Q", title=None, axis=alt.Axis(labelColor="#b4bac8", gridColor="#2f3445", domain=False, ticks=False, labelFontSize=13)),
+                tooltip=[alt.Tooltip("Period:N"), alt.Tooltip(f"{unit_label}:Q")],
+            )
+            .properties(height=240, background="transparent")
+            .configure_view(stroke=None)
+        )
+        st.altair_chart(chart, width="stretch")
+        with st.expander("Show as a table"):
+            st.dataframe(df, hide_index=True, width="stretch")
+
+    # 5. Every charge explained
     st.markdown(
         f'<div class="section">💰 What you are paying for ({len(report.charges)})</div>', unsafe_allow_html=True
     )
@@ -405,23 +598,64 @@ if decode and uploaded:
             unsafe_allow_html=True,
         )
 
-    # 4. Tips
+    # 6. Subsidies and discounts
+    if report.subsidies:
+        st.markdown('<div class="section">🎁 Discounts and subsidies you got</div>', unsafe_allow_html=True)
+        for s in report.subsidies:
+            st.markdown(
+                f'<div class="card subsidy"><div class="charge"><span class="name">{html.escape(s.name)}</span>'
+                f'<span class="amt">{html.escape(s.amount)}</span></div>'
+                f'<div class="why">{html.escape(s.explanation)}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+    # 7. Payment details
+    if shown(report.last_payment) or report.payment_options:
+        st.markdown('<div class="section">💳 Payment details</div>', unsafe_allow_html=True)
+        if shown(report.last_payment):
+            st.markdown(card("LAST PAYMENT RECEIVED", report.last_payment), unsafe_allow_html=True)
+        if report.payment_options:
+            ways = "".join(f"<li>{html.escape(p)}</li>" for p in report.payment_options)
+            st.markdown(f'<div class="card"><div class="label">WAYS TO PAY</div><ul>{ways}</ul></div>', unsafe_allow_html=True)
+
+    # 8. Tips
     st.markdown('<div class="section">💡 Ways to save money</div>', unsafe_allow_html=True)
     for t in report.tips:
         st.markdown(f'<div class="card tip">💡 {html.escape(t)}</div>', unsafe_allow_html=True)
 
+    # 9. Words on the bill explained
+    if report.glossary:
+        with st.expander(f"📖 Words on your bill explained ({len(report.glossary)})"):
+            for g in report.glossary:
+                st.markdown(
+                    f'<div class="card"><span class="term">{html.escape(g.term)}</span>'
+                    f'<div class="why">{html.escape(g.meaning)}</div></div>',
+                    unsafe_allow_html=True,
+                )
+
     # Plain-text copy the user can save or share
     lines = [
         f"Bill: {report.bill_type} ({report.provider})",
+        f"Plan / tariff: {report.plan_or_tariff}",
+        f"Bill date: {report.bill_date}",
         f"Period: {report.billing_period}",
         f"Amount to pay: {report.total_amount}",
         f"Due date: {report.due_date}",
+        f"If paid late: {report.amount_after_due_date}",
+        "",
+        "What to do now:",
+        *[f"- {s}" for s in report.action_steps],
         "",
         "Things to check:",
         *([f"- {f.title}: {f.detail}" for f in report.red_flags] or ["- None"]),
         "",
+        f"Usage: {u.units_used} {u.unit_name} (reading: {u.reading_type})",
+        "",
         "Charges:",
         *[f"- {c.name}: {c.amount} — {c.explanation}" for c in report.charges],
+        "",
+        "Subsidies:",
+        *([f"- {s.name}: {s.amount} — {s.explanation}" for s in report.subsidies] or ["- None"]),
         "",
         "Tips:",
         *[f"- {t}" for t in report.tips],

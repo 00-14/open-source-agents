@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import datetime
 import mimetypes
 import os
 import sys
@@ -17,7 +18,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import errors, types
 
-from guardrails import INJECTION_RULE, check_file
+from guardrails import INJECTION_RULE, check_file, date_rule
 
 PROMPT = """You are a friendly assistant that explains Indian utility bills
 (electricity, water, gas, mobile, broadband) to ordinary people.
@@ -71,7 +72,7 @@ def decode_bill_bytes(file_bytes: bytes, mime_type: str, language: str) -> str:
         model=os.getenv("MODEL_NAME", "gemini-3.5-flash"),
         contents=[
             types.Part.from_bytes(data=file_bytes, mime_type=mime_type),
-            PROMPT.format(language=language),
+            PROMPT.format(language=language) + date_rule(datetime.date.today()),
         ],
     )
     return response.text

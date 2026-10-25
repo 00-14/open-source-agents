@@ -19,6 +19,7 @@
 - **Multi-language**: explanation in English, Kannada, Hindi or any language Gemini supports (`--lang`).
 - **Money-saving tips**: practical tips specific to the bill type.
 - **Two ways to use it**: a command-line tool (`main.py`) and a dark-mode web app (`app.py`) with large text and simple steps, designed for users of all ages.
+- **Detailed web report**: due-date countdown, a "what to do now" checklist, usage and meter readings (actual vs estimated, daily average), a usage-history chart when the bill prints past months, subsidies applied, payment details, and a glossary of terms printed on the bill.
 
 ---
 
@@ -45,7 +46,7 @@
 
 `main.py` reads the bill file, detects its type, and sends it along with a structured prompt to Gemini in a single request. The prompt tells the model to use only what is printed on the bill and to say so when something is unreadable, rather than guess.
 
-`app.py` (web app) sends the uploaded bill the same way, but asks Gemini for a JSON response matching a fixed schema (amount, due date, charges, red flags, tips). The page then shows these as cards instead of one long block of text.
+`app.py` (web app) sends the uploaded bill the same way, but asks Gemini for a JSON response matching a fixed schema (amount, dates, usage, charges, subsidies, red flags, action steps, glossary, tips). The page then shows these as cards instead of one long block of text.
 
 ---
 
@@ -223,6 +224,7 @@ This project uses **custom guardrails** written in Python (no third-party guardr
 | Grounding rule | Anti-hallucination | Gemini must use only what is printed on the bill and write "Not shown" instead of guessing. |
 | Not-a-bill check | Relevance check | The web app's schema has an `is_bill` field. Non-bill uploads get a friendly message instead of an invented explanation. |
 | Structured output | Schema enforcement | The web app forces a JSON response (Pydantic `BillReport` schema), so the answer can't drift off-topic. |
+| Date rule + date check | Anti-hallucination / output validation | The prompt gives Gemini today's date and tells it to copy dates exactly as printed, never "correcting" the year. Dates more than 2 years old or 1 year ahead trigger a warning, and the due-date countdown is hidden for them. |
 | Math check | Output validation | The app checks that the charges add up to the total (±₹2 or 2% for rounding) and warns the user if they don't. |
 | Output sanitization | Output safety | All model text is HTML-escaped before it is shown on the page. |
 | Usage limits | Abuse / cost protection | Web app: max 5 bills per visit, 20-second cooldown between requests, and 200 bills per day across all visitors. |
